@@ -53,7 +53,7 @@ RGB RGB24 YUV422 YUYV RGB565 YUV444 YCbCr BGR BGR24 RGBX RGB32 BGRX BGR32
 ```ruby
 require 'jpeg'
 
-dec = JPEG::Encoder.new(640, 480, :pixel_format => :YCbCr)
+enc = JPEG::Encoder.new(640, 480, :pixel_format => :YCbCr)
 
 IO.binwrite("test.jpg", enc << IO.binread("test.raw"))
 ```
