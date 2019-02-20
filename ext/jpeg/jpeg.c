@@ -82,6 +82,7 @@ static const char* encoder_opts_keys[] = {
   "pixel_format",             // {str}
   "quality",                  // {integer}
   "scale",                    // {rational} or {float}
+  "dct_method"                // {str}
 };
 
 static ID encoder_opts_ids[N(encoder_opts_keys)];
@@ -92,6 +93,7 @@ typedef struct {
   int height;
 
   int data_size;
+  J_DCT_METHOD dct_method;
 
   struct jpeg_compress_struct cinfo;
   struct jpeg_error_mgr jerr;
@@ -112,6 +114,7 @@ static const char* decoder_opts_keys[] = {
   "without_meta",             // {bool}
   "expand_colormap",          // {bool}
   "scale",                    // {rational} or {float}
+  "dct_method"                // {str}
 };
 
 static ID decoder_opts_ids[N(decoder_opts_keys)];
@@ -138,6 +141,7 @@ typedef struct {
   boolean do_block_smoothing;
   boolean quantize_colors;
   J_DITHER_MODE dither_mode;
+  J_DCT_METHOD dct_method;
   boolean two_pass_quantize;
   int desired_number_of_colors;
   boolean enable_1pass_quant;
@@ -190,6 +194,8 @@ rb_encoder_alloc(VALUE self)
 
   ptr = ALLOC(jpeg_encode_t);
   memset(ptr, 0, sizeof(*ptr));
+
+  ptr->dct_method = JDCT_FASTEST;
 
   return Data_Wrap_Struct(encoder_klass, 0, rb_encoder_free, ptr);
 }
@@ -314,6 +320,24 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
     break;
   }
 
+  /*
+   * eval dct_method option
+   */
+  if (opts[3] == Qundef || EQ_STR(opts[3], "FASTEST")) {
+    ptr->dct_method = JDCT_FASTEST;
+
+  } else if (EQ_STR(opts[3], "ISLOW")) {
+    ptr->dct_method = JDCT_ISLOW;
+
+  } else if (EQ_STR(opts[3], "IFAST")) {
+    ptr->dct_method = JDCT_IFAST;
+
+  } else if (EQ_STR(opts[3], "FLOAT")) {
+    ptr->dct_method = JDCT_FLOAT;
+
+  } else {
+    ARGUMENT_ERROR("Unsupportd :dct_method option value.");
+  }
 
   /*
    * set context
@@ -343,7 +367,7 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
   ptr->cinfo.optimize_coding  = TRUE;
   ptr->cinfo.arith_code       = TRUE;
   ptr->cinfo.raw_data_in      = FALSE;
-  ptr->cinfo.dct_method       = JDCT_FASTEST;
+  ptr->cinfo.dct_method       = ptr->dct_method;
 
   jpeg_set_defaults(&ptr->cinfo);
   jpeg_set_quality(&ptr->cinfo, quality, TRUE);
@@ -642,6 +666,7 @@ rb_decoder_alloc(VALUE self)
   ptr->do_block_smoothing       = FALSE;
   ptr->quantize_colors          = FALSE;
   ptr->dither_mode              = JDITHER_NONE;
+  ptr->dct_method               = JDCT_FASTEST;
   ptr->desired_number_of_colors = 0;
   ptr->enable_1pass_quant       = FALSE;
   ptr->enable_external_quant    = FALSE;
@@ -970,6 +995,28 @@ eval_decoder_opt_scale(jpeg_decode_t* ptr, VALUE opt)
 }
 
 static void
+eval_decoder_opt_dct_method(jpeg_decode_t* ptr, VALUE opt)
+{
+  if (opt != Qundef) {
+    if (EQ_STR(opt, "ISLOW")) {
+      ptr->dct_method = JDCT_ISLOW;
+
+    } else if (EQ_STR(opt, "IFAST")) {
+      ptr->dct_method = JDCT_IFAST;
+
+    } else if (EQ_STR(opt, "FLOAT")) {
+      ptr->dct_method = JDCT_FLOAT;
+
+    } else if (EQ_STR(opt, "FASTEST")) {
+      ptr->dct_method = JDCT_FASTEST;
+
+    } else {
+      ARGUMENT_ERROR("Unsupportd :dct_method option value.");
+    }
+  }
+}
+
+static void
 set_decoder_context( jpeg_decode_t* ptr, VALUE opt)
 {
   VALUE opts[N(decoder_opts_ids)];
@@ -990,11 +1037,10 @@ set_decoder_context( jpeg_decode_t* ptr, VALUE opt)
   eval_decoder_opt_use_1pass_quantizer(ptr, opts[5]);
   eval_decoder_opt_use_external_colormap(ptr, opts[6]);
   eval_decoder_opt_use_2pass_quantizer(ptr, opts[7]);
-
   eval_decoder_opt_without_meta(ptr, opts[8]);
   eval_decoder_opt_expand_colormap(ptr, opts[9]);
-
   eval_decoder_opt_scale(ptr, opts[10]);
+  eval_decoder_opt_dct_method(ptr, opts[11]);
 }
 
 static VALUE
@@ -1336,7 +1382,7 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
       jpeg_read_header(cinfo, TRUE);
 
       cinfo->raw_data_out              = FALSE;
-      cinfo->dct_method                = JDCT_FLOAT;
+      cinfo->dct_method                = ptr->dct_method;
 
       cinfo->out_color_space           = ptr->out_color_space;
       cinfo->out_color_components      = ptr->out_color_components;

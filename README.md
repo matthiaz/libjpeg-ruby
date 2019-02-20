@@ -23,8 +23,10 @@ Or install it yourself as:
 require 'jpeg'
 
 dec = JPEG::Decoder.new(:pixel_format => :BGR)
-raw = dec << IO.binread("test.jpg")
 
+p dec.read_header(IO.binread("test.jpg")
+
+raw = dec << IO.binread("test.jpg")
 p raw.meta
 
 IO.binwrite("test.bgr", raw)
@@ -44,24 +46,29 @@ IO.binwrite("test.bgr", raw)
 | :without_meta | Boolean | T.B.D |
 | :expand_colormap | Booblean | T.B.D |
 | :scale | Rational or Float | T.B.D |
+| :dct_method | String or Symbol | T.B.D |
 
 #### supported output format
 RGB RGB24 YUV422 YUYV RGB565 YUV444 YCbCr BGR BGR24 RGBX RGB32 BGRX BGR32 
 
-### decode sample
+#### supported DCT method
+ISLOW IFAST FLOAT FASTEST
+
+### encode sample
 
 ```ruby
 require 'jpeg'
 
-dec = JPEG::Encoder.new(640, 480, :pixel_format => :YCbCr)
+enc = JPEG::Encoder.new(640, 480, :pixel_format => :YCbCr)
 
 IO.binwrite("test.jpg", enc << IO.binread("test.raw"))
 ```
 #### encode option
-#### decode options
+#### encode options
 | option | value type | description |
 |---|---|---|
 | :pixel_fromat | String or Symbol | input format |
 | :quality | Integer | encode quality (0-100) |
 | :scale | Rational or Float | |
+| :dct_method | String or Symbol | T.B.D |
 
