@@ -15,6 +15,9 @@ Or install it yourself as:
 
     $ gem install libjpeg-ruby
 
+If you need to specify the libjpeg path, use the following options:
+
+    $ gem install libjpeg-ruby -- --with-jpeg-include ~/env/opts/include --with-jpeg-lib ~/env/opts/lib
 ## Usage
 
 ### decode sample
