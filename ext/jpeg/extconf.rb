@@ -1,4 +1,5 @@
 require 'mkmf'
+require 'optparse'
 
 OptionParser.new { |opt|
   opt.on('--with-jpeg-include=PATH', String) { |path|
