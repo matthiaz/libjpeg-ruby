@@ -22,46 +22,49 @@
 #include <jpeglib.h>
 
 #include "ruby.h"
+#include "ruby/encoding.h"
 
-#define UNIT_LINES                  10
+#define UNIT_LINES                 10
 
 #ifdef DEFAULT_QUALITY
 #undef DEFAULT_QUALITY
 #endif /* defined(DEFAULT_QUALITY) */
 
-#define DEFAULT_QUALITY             75
-#define DEFAULT_INPUT_COLOR_SPACE   JCS_YCbCr
-#define DEFAULT_INPUT_COMPONENTS    2
+#define DEFAULT_QUALITY            75
+#define DEFAULT_INPUT_COLOR_SPACE  JCS_YCbCr
+#define DEFAULT_INPUT_COMPONENTS   2
 
-#define FMT_YUV422                  1
-#define FMT_RGB565                  2
-#define FMT_GRAYSCALE               3
-#define FMT_YUV                     4
-#define FMT_RGB                     5
-#define FMT_BGR                     6
-#define FMT_RGB32                   7
-#define FMT_BGR32                   8
+#define FMT_YUV422                 1
+#define FMT_RGB565                 2
+#define FMT_GRAYSCALE              3
+#define FMT_YUV                    4
+#define FMT_RGB                    5
+#define FMT_BGR                    6
+#define FMT_RGB32                  7
+#define FMT_BGR32                  8
 
-#define FMT_YVU                    20   /* original extend */
+#define FMT_YVU                    20     /* original extend */
 
-#define N(x)                        (sizeof(x)/sizeof(*x))
+#define JPEG_APP1                  0xe1   /* Exif marker */
 
-#define RUNTIME_ERROR(msg)          rb_raise(rb_eRuntimeError, (msg))
-#define ARGUMENT_ERROR(msg)         rb_raise(rb_eArgError, (msg))
+#define N(x)                       (sizeof(x)/sizeof(*x))
 
-#define IS_COLORMAPPED(ci)          (((ci)->actual_number_of_colors > 0) &&\
-                                     ((ci)->colormap != NULL) && \
-                                     ((ci)->output_components == 1) && \
-                                        (((ci)->out_color_components == 1) || \
-                                         ((ci)->out_color_components == 3)))
+#define RUNTIME_ERROR(msg)         rb_raise(rb_eRuntimeError, (msg))
+#define ARGUMENT_ERROR(msg)        rb_raise(rb_eArgError, (msg))
+
+#define IS_COLORMAPPED(ci)         (((ci)->actual_number_of_colors > 0) &&\
+                                    ((ci)->colormap != NULL) && \
+                                    ((ci)->output_components == 1) && \
+                                       (((ci)->out_color_components == 1) || \
+                                        ((ci)->out_color_components == 3)))
 
 #define ALLOC_ARRAY() \
         ((JSAMPARRAY)xmalloc(sizeof(JSAMPROW) * UNIT_LINES))
 #define ALLOC_ROWS(w,c) \
         ((JSAMPROW)xmalloc(sizeof(JSAMPLE) * (w) * (c) * UNIT_LINES))
 
-#define EQ_STR(val,str)             (rb_to_id(val) == rb_intern(str))
-#define EQ_INT(val,n)               (FIX2INT(val) == n)
+#define EQ_STR(val,str)            (rb_to_id(val) == rb_intern(str))
+#define EQ_INT(val,n)              (FIX2INT(val) == n)
 
 static VALUE module;
 static VALUE encoder_klass;
@@ -77,6 +80,168 @@ static ID id_height;
 static ID id_orig_cs;
 static ID id_out_cs;
 static ID id_ncompo;
+static ID id_exif;
+
+typedef struct {
+  int tag;
+  const char* name;
+} tag_entry_t;
+
+tag_entry_t tag_tiff[] = {
+  /* 0th IFD */
+  {0x0100, "image_width",                  },
+  {0x0101, "image_length",                 },
+  {0x0102, "bits_per_sample",              },
+  {0x0103, "compression",                  },
+  {0x0106, "photometric_interpretation",   },
+  {0x010e, "image_description",            },
+  {0x010f, "maker",                        },
+  {0x0110, "model",                        },
+  {0x0111, "strip_offsets",                },
+  {0x0112, "orientation",                  },
+  {0x0115, "sample_per_pixel",             },
+  {0x0116, "rows_per_strip",               },
+  {0x0117, "strip_byte_counts",            },
+  {0x011a, "x_resolution",                 },
+  {0x011b, "y_resolution",                 },
+  {0x011c, "planer_configuration",         },
+  {0x0128, "resolution_unit",              },
+  {0x012d, "transfer_function",            },
+  {0x0131, "software",                     },
+  {0x0132, "date_time",                    },
+  {0x013b, "artist",                       },
+  {0x013e, "white_point",                  },
+  {0x013f, "primary_chromaticities",       },
+  {0x0201, "jpeg_interchange_format",      },
+  {0x0202, "jpeg_interchange_format_length"},
+  {0x0211, "ycbcr_coefficients",           },
+  {0x0212, "ycbcr_sub_sampling",           },
+  {0x0213, "ycbcr_positioning",            },
+  {0x0214, "reference_black_white",        },
+  {0x0d68, "copyright",                    },
+  {0x8298, "copyright",                    },
+  {0x8769, NULL,                           }, /* ExifIFDPointer    */
+  {0x8825, NULL,                           }, /* GPSInfoIFDPointer */
+  {0xc4a5, "print_im",                     },
+};
+
+tag_entry_t tag_exif[] = {
+  /* Exif IFD */
+  {0x829a, "exposure_time",                },
+  {0x829d, "f_number",                     },
+  {0x8822, "exposure_program",             },
+  {0x8824, "spectral_sensitivity",         },
+  {0x8827, "iso_speed_ratings",            },
+  {0x8828, "oecf",                         },
+  {0x882a, "time_zone_offset",             },
+  {0x882b, "self_timer_mode",              },
+  {0x8830, "sensitivity_type",             },
+  {0x8831, "standard_output_sensitivity",  },
+  {0x8832, "recommended_exposure_index",   },
+  {0x9000, "exif_version",                 },
+  {0x9003, "data_time_original",           },
+  {0x9004, "data_time_digitized",          },
+  {0x9010, "offset_time",                  },
+  {0x9011, "offset_time_original",         },
+  {0x9012, "offset_time_digitized",        },
+  {0x9101, "color_space",                  },
+  {0x9102, "components_configuration",     },
+  {0x9201, "shutter_speed_value",          },
+  {0x9202, "apertutre_value",              },
+  {0x9203, "brightness_value",             },
+  {0x9204, "exposure_bias_value",          },
+  {0x9205, "max_aperture_value",           },
+  {0x9206, "subject_distance",             },
+  {0x9207, "metering_mode",                },
+  {0x9208, "light_source",                 },
+  {0x9209, "flash",                        },
+  {0x920a, "focal_length",                 },
+  {0x927c, "marker_note",                  },
+  {0x9286, "user_comment",                 },
+  {0x9290, "sub_sec_time",                 },
+  {0x9291, "sub_sec_time_original",        },
+  {0x9292, "sub_sec_time_digitized",       },
+  {0xa000, "flash_pix_version",            },
+  {0xa001, "color_space",                  },
+  {0xa002, "pixel_x_dimension",            },
+  {0xa003, "pixel_y_dimension",            },
+  {0xa004, "related_sound_file",           },
+  {0xa005, NULL,                           }, /* InteroperabilityIFDPointer */
+  {0xa20b, "flash_energy",                 },
+  {0xa20b, "flash_energy",                 },
+  {0xa20c, "spatial_frequency_response",   },
+  {0xa20e, "focal_panel_x_resolution",     },
+  {0xa20f, "focal_panel_y_resolution",     },
+  {0xa210, "focal_panel_resolution_unit",  },
+  {0xa214, "subject_location",             },
+  {0xa215, "exposure_index",               },
+  {0xa217, "sensing_method",               },
+  {0xa300, "file_source",                  },
+  {0xa301, "scene_type",                   },
+  {0xa302, "cfa_pattern",                  },
+  {0xa401, "custom_rendered",              },
+  {0xa402, "exposure_mode",                },
+  {0xa403, "white_balance",                },
+  {0xa404, "digital_zoom_ratio",           },
+  {0xa405, "focal_length_in_35mm_film",    },
+  {0xa406, "scene_capture_type",           },
+  {0xa407, "gain_control",                 },
+  {0xa408, "contrast",                     },
+  {0xa409, "sturation",                    },
+  {0xa40a, "sharpness",                    },
+  {0xa40b, "device_setting_description",   },
+  {0xa40c, "subject_distance_range",       },
+  {0xa420, "image_unique_id",              },
+  {0xa430, "owner_name",                   },
+  {0xa431, "serial_number",                },
+  {0xa432, "lens_info",                    },
+  {0xa433, "lens_make",                    },
+  {0xa434, "lens_model",                   },
+  {0xa435, "lens_serial_number",           },
+};
+
+tag_entry_t tag_gps[] = {
+  /* GPS IFD */
+  {0x0000, "version_id",                   },
+  {0x0001, "latitude_ref",                 },
+  {0x0002, "latitude",                     },
+  {0x0003, "longitude_ref",                },
+  {0x0004, "longitude",                    },
+  {0x0005, "altitude_ref",                 },
+  {0x0006, "altitude",                     },
+  {0x0007, "timestamp",                    },
+  {0x0008, "satellites",                   },
+  {0x0009, "status",                       },
+  {0x000a, "measure_mode",                 },
+  {0x000b, "dop",                          },
+  {0x000c, "speed_ref",                    },
+  {0x000d, "speed",                        },
+  {0x000e, "track_ref",                    },
+  {0x000f, "track",                        },
+  {0x0010, "img_direction_ref",            },
+  {0x0011, "img_direction",                },
+  {0x0012, "map_datum",                    },
+  {0x0013, "dest_latitude_ref",            },
+  {0x0014, "dest_latitude",                },
+  {0x0015, "dest_longitude_ref",           },
+  {0x0016, "dest_longitude",               },
+  {0x0017, "bearing_ref",                  },
+  {0x0018, "bearing",                      },
+  {0x0019, "dest_distance_ref",            },
+  {0x001a, "dest_distance",                },
+  {0x001b, "processing_method",            },
+  {0x001c, "area_infotmation",             },
+  {0x001d, "date_stamp",                   },
+  {0x001e, "differential",                 },
+};
+
+tag_entry_t tag_i14y[] = {
+  /* Interoperability IFD */
+  {0x0001, "interoperability_index",       },
+  {0x0002, "interoperability_version",     },
+  {0x1000, "related_image_file_format",    },
+  {0x1001, "related_image_width",          },
+};
 
 static const char* encoder_opts_keys[] = {
   "pixel_format",             // {str}
@@ -114,7 +279,8 @@ static const char* decoder_opts_keys[] = {
   "without_meta",             // {bool}
   "expand_colormap",          // {bool}
   "scale",                    // {rational} or {float}
-  "dct_method"                // {str}
+  "dct_method",               // {str}
+  "with_exif"                 // {bool}
 };
 
 static ID decoder_opts_ids[N(decoder_opts_keys)];
@@ -130,6 +296,7 @@ typedef struct {
   int format;
   int need_meta;
   int expand_colormap;
+  int parse_exif;
 
   J_COLOR_SPACE out_color_space;
   int scale_num;
@@ -151,6 +318,47 @@ typedef struct {
   struct jpeg_decompress_struct cinfo;
   ext_error_t err_mgr;
 } jpeg_decode_t;
+
+
+static VALUE
+lookup_tag_symbol(tag_entry_t* tbl, size_t n, int tag)
+{
+  VALUE ret;
+  int l;
+  int r;
+  int i;
+  tag_entry_t* p;
+  char buf[16];
+
+  ret = Qundef;
+  l   = 0;
+  r   = n - 1;
+
+  while (r >= l) {
+    i = (l + r) / 2;
+    p = tbl + i;
+
+    if (p->tag < tag) {
+      l = i + 1;
+      continue;
+    }
+
+    if (p->tag > tag) {
+      r = i - 1;
+      continue;
+    }
+
+    ret = (p->name)? ID2SYM(rb_intern(p->name)): Qnil;
+    break;
+  }
+
+  if (ret == Qundef) {
+    sprintf(buf, "tag_%04x", tag);
+    ret = ID2SYM(rb_intern(buf));
+  }
+
+  return ret;
+}
 
 static void
 encode_output_message(j_common_ptr cinfo)
@@ -300,6 +508,9 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
   /*
    * eval scale option
    */
+  (void)scale_num;
+  (void)scale_denom;
+
   switch (TYPE(opts[2])) {
   case T_UNDEF:
     // Nothing
@@ -653,6 +864,7 @@ rb_decoder_alloc(VALUE self)
   ptr->format                   = FMT_RGB;
   ptr->need_meta                = !0;
   ptr->expand_colormap          = 0;
+  ptr->parse_exif               = 0;
 
   ptr->out_color_space          = JCS_RGB;
 
@@ -759,44 +971,16 @@ eval_decoder_opt_output_gamma(jpeg_decode_t* ptr, VALUE opt)
 static void
 eval_decoder_opt_do_fancy_upsampling(jpeg_decode_t* ptr, VALUE opt)
 {
-  switch (TYPE(opt)) {
-  case T_UNDEF:
-    // Nothing
-    break;
-
-  case T_TRUE:
-    ptr->do_fancy_upsampling = TRUE;
-    break;
-
-  case T_FALSE:
-    ptr->do_fancy_upsampling = FALSE;
-    break;
-
-  default:
-    ARGUMENT_ERROR("Unsupportd :do_fancy_up_sampling option value.");
-    break;
+  if (opt != Qundef) {
+    ptr->do_fancy_upsampling = (RTEST(opt))? TRUE: FALSE;
   }
 }
 
 static void
 eval_decoder_opt_do_smoothing(jpeg_decode_t* ptr, VALUE opt)
 {
-  switch (TYPE(opt)) {
-  case T_UNDEF:
-    // Nothing
-    break;
-
-  case T_TRUE:
-    ptr->do_block_smoothing = TRUE;
-    break;
-
-  case T_FALSE:
-    ptr->do_block_smoothing = FALSE;
-    break;
-
-  default:
-    ARGUMENT_ERROR("Unsupportd :do_smoothing option value.");
-    break;
+  if (opt != Qundef) {
+    ptr->do_block_smoothing = (RTEST(opt))? TRUE: FALSE;
   }
 }
 
@@ -836,18 +1020,7 @@ eval_decoder_opt_dither( jpeg_decode_t* ptr, VALUE opt)
       ARGUMENT_ERROR("dither mode is illeagal value.");
     }
 
-    switch (TYPE(pass2)) {
-    case T_TRUE:
-      ptr->two_pass_quantize = TRUE;
-      break;
-
-    case T_FALSE:
-      ptr->two_pass_quantize = FALSE;
-      break;
-
-    default:
-      ARGUMENT_ERROR( "2pass quantize flag is illeagal value.");
-    }
+    ptr->two_pass_quantize = (RTEST(pass2))? TRUE: FALSE;
 
     if (TYPE(n_col) == T_FIXNUM) {
       ptr->desired_number_of_colors = FIX2INT(n_col);
@@ -860,113 +1033,55 @@ eval_decoder_opt_dither( jpeg_decode_t* ptr, VALUE opt)
 static void
 eval_decoder_opt_use_1pass_quantizer(jpeg_decode_t* ptr, VALUE opt)
 {
-  switch (TYPE(opt)) {
-  case T_UNDEF:
-    // Nothing
-    break;
-
-  case T_TRUE:
-    ptr->enable_1pass_quant = TRUE;
-    ptr->buffered_image     = TRUE;
-    break;
-
-  case T_FALSE:
-    ptr->enable_1pass_quant = FALSE;
-    break;
-
-  default:
-    ARGUMENT_ERROR("Unsupportd :use_1pass_quantizer option value.");
-    break;
+  if (opt != Qundef) {
+    if (RTEST(opt)) {
+      ptr->enable_1pass_quant = TRUE;
+      ptr->buffered_image     = TRUE;
+    } else {
+      ptr->enable_1pass_quant = FALSE;
+    }
   }
 }
 
 static void
 eval_decoder_opt_use_external_colormap(jpeg_decode_t* ptr, VALUE opt)
 {
-  switch (TYPE(opt)) {
-  case T_UNDEF:
-    // Nothing
-    break;
-
-  case T_TRUE:
-    ptr->enable_external_quant = TRUE;
-    ptr->buffered_image        = TRUE;
-    break;
-
-  case T_FALSE:
-    ptr->enable_external_quant = FALSE;
-    break;
-
-  default:
-    ARGUMENT_ERROR("Unsupportd :use_external_colormap option value.");
-    break;
+  if (opt != Qundef) {
+    if (RTEST(opt)) {
+      ptr->enable_external_quant = TRUE;
+      ptr->buffered_image        = TRUE;
+    } else {
+      ptr->enable_external_quant = FALSE;
+    }
   }
 }
 
 static void
 eval_decoder_opt_use_2pass_quantizer(jpeg_decode_t* ptr, VALUE opt)
 {
-  switch (TYPE(opt)) {
-  case T_UNDEF:
-    // Nothing
-    break;
-
-  case T_TRUE:
-    ptr->enable_2pass_quant = TRUE;
-    ptr->buffered_image     = TRUE;
-    break;
-
-  case T_FALSE:
-    ptr->enable_2pass_quant = FALSE;
-    break;
-
-  default:
-    ARGUMENT_ERROR("Unsupportd :use_2pass_quantizer option value.");
-    break;
+  if (opt != Qundef) {
+    if (RTEST(opt)) {
+      ptr->enable_2pass_quant = TRUE;
+      ptr->buffered_image     = TRUE;
+    } else {
+      ptr->enable_2pass_quant = FALSE;
+    }
   }
 }
 
 static void
 eval_decoder_opt_without_meta(jpeg_decode_t* ptr, VALUE opt)
 {
-  switch (TYPE(opt)) {
-  case T_UNDEF:
-    // Nothing
-    break;
-
-  case T_TRUE:
-    ptr->need_meta = 0;
-    break;
-
-  case T_FALSE:
-    ptr->need_meta = !0;
-    break;
-
-  default:
-    ARGUMENT_ERROR("Unsupportd :without_meta option value.");
-    break;
+  if (opt != Qundef) {
+    ptr->need_meta = RTEST(opt);
   }
 }
 
 static void
 eval_decoder_opt_expand_colormap(jpeg_decode_t* ptr, VALUE opt)
 {
-  switch (TYPE(opt)) {
-  case T_UNDEF:
-    // Nothing
-    break;
-
-  case T_TRUE:
-    ptr->expand_colormap = !0;
-    break;
-
-  case T_FALSE:
-    ptr->expand_colormap = 0;
-    break;
-
-  default:
-    ARGUMENT_ERROR("Unsupportd :exapnd_colormap option value.");
-    break;
+  if (opt != Qundef) {
+    ptr->expand_colormap = RTEST(opt);
   }
 }
 
@@ -1017,6 +1132,14 @@ eval_decoder_opt_dct_method(jpeg_decode_t* ptr, VALUE opt)
 }
 
 static void
+eval_decoder_opt_with_exif(jpeg_decode_t* ptr, VALUE opt)
+{
+  if (opt != Qundef) {
+    ptr->parse_exif = RTEST(opt);
+  }
+}
+
+static void
 set_decoder_context( jpeg_decode_t* ptr, VALUE opt)
 {
   VALUE opts[N(decoder_opts_ids)];
@@ -1024,7 +1147,7 @@ set_decoder_context( jpeg_decode_t* ptr, VALUE opt)
   /*
    * parse options
    */
-  rb_get_kwargs( opt, decoder_opts_ids, 0, N(decoder_opts_ids), opts);
+  rb_get_kwargs(opt, decoder_opts_ids, 0, N(decoder_opts_ids), opts);
 
   /*
    * set context
@@ -1041,6 +1164,7 @@ set_decoder_context( jpeg_decode_t* ptr, VALUE opt)
   eval_decoder_opt_expand_colormap(ptr, opts[9]);
   eval_decoder_opt_scale(ptr, opts[10]);
   eval_decoder_opt_dct_method(ptr, opts[11]);
+  eval_decoder_opt_with_exif(ptr, opts[12]);
 }
 
 static VALUE
@@ -1072,7 +1196,6 @@ rb_decoder_initialize( int argc, VALUE *argv, VALUE self)
 static VALUE
 rb_decoder_set(VALUE self, VALUE opt)
 {
-  VALUE ret;
   jpeg_decode_t* ptr;
 
   /*
@@ -1083,7 +1206,7 @@ rb_decoder_set(VALUE self, VALUE opt)
   /*
    * check argument
    */
-  Check_Type( opt, T_HASH);
+  Check_Type(opt, T_HASH);
 
   /*
    * set context
@@ -1170,6 +1293,608 @@ get_colorspace_str( J_COLOR_SPACE cs)
   return rb_str_new_cstr(cstr);
 }
 
+typedef struct {
+  int be;
+  uint8_t* head;
+  uint8_t* cur;
+  size_t size;
+
+  struct {
+    tag_entry_t* tbl;
+    size_t n;
+  } tags;
+
+  int next;
+} exif_t;
+
+static uint16_t
+get_u16(uint8_t* src, int be)
+{
+  uint16_t ret;
+
+  if (be) {
+    ret = (((src[0] << 8) & 0xff00)|
+           ((src[1] << 0) & 0x00ff));
+  } else {
+    ret = (((src[1] << 8) & 0xff00)|
+           ((src[0] << 0) & 0x00ff));
+  }
+
+  return ret;
+}
+
+/*
+static int16_t
+get_s16(uint8_t* src, int be)
+{
+  int16_t ret;
+
+  if (be) {
+    ret = (((src[0] << 8) & 0xff00)|
+           ((src[1] << 0) & 0x00ff));
+  } else {
+    ret = (((src[1] << 8) & 0xff00)|
+           ((src[0] << 0) & 0x00ff));
+  }
+
+  return ret;
+}
+*/
+
+static uint32_t
+get_u32(uint8_t* src, int be)
+{
+  uint32_t ret;
+
+  if (be) {
+    ret = (((src[0] << 24) & 0xff000000)|
+           ((src[1] << 16) & 0x00ff0000)|
+           ((src[2] <<  8) & 0x0000ff00)|
+           ((src[3] <<  0) & 0x000000ff));
+  } else {
+    ret = (((src[3] << 24) & 0xff000000)|
+           ((src[2] << 16) & 0x00ff0000)|
+           ((src[1] <<  8) & 0x0000ff00)|
+           ((src[0] <<  0) & 0x000000ff));
+  }
+
+  return ret;
+}
+
+static int32_t
+get_s32(uint8_t* src, int be)
+{
+  int32_t ret;
+
+  if (be) {
+    ret = (((src[0] << 24) & 0xff000000)|
+           ((src[1] << 16) & 0x00ff0000)|
+           ((src[2] <<  8) & 0x0000ff00)|
+           ((src[3] <<  0) & 0x000000ff));
+  } else {
+    ret = (((src[3] << 24) & 0xff000000)|
+           ((src[2] << 16) & 0x00ff0000)|
+           ((src[1] <<  8) & 0x0000ff00)|
+           ((src[0] <<  0) & 0x000000ff));
+  }
+
+  return ret;
+}
+
+static void
+exif_increase(exif_t* ptr, size_t size)
+{
+  ptr->cur  += size;
+  ptr->size -= size;
+}
+
+static void
+exif_init(exif_t* ptr, uint8_t* src, size_t size)
+{
+  int be;
+  uint16_t ident;
+  uint32_t off;
+
+  /*
+   * Check Exif idntifier
+   */
+  if (memcmp(src, "Exif\0\0", 6)) {
+    rb_raise(decerr_klass, "invalid exif identifier");
+  }
+
+  /*
+   * Check TIFF header and judge endian
+   */
+  do {
+    if (!memcmp(src + 6, "MM", 2)) {
+      be = !0;
+      break;
+    }
+
+    if (!memcmp(src + 6, "II", 2)) {
+      be = 0;
+      break;
+    }
+
+    rb_raise(decerr_klass, "invalid tiff header");
+  } while (0);
+
+  /*
+   * Check TIFF identifier
+   */
+  ident = get_u16(src + 8, be);
+  if (ident != 0x002a) {
+    rb_raise(decerr_klass, "invalid tiff identifier");
+  }
+
+  /*
+   * get offset for 0th IFD
+   */
+  off = get_u32(src + 10, be);
+  if (off < 8 || off >= size - 6) {
+    rb_raise(decerr_klass, "invalid offset dentifier");
+  }
+
+  /*
+   * initialize Exif context
+   */
+  ptr->be       = be;
+  ptr->head     = src + 6;
+  ptr->cur      = ptr->head + off;
+  ptr->size     = size - (6 + off);
+  ptr->tags.tbl = tag_tiff;
+  ptr->tags.n   = N(tag_tiff);
+  ptr->next     = 0;
+}
+
+static void
+exif_fetch_tag_header(exif_t* ptr, uint16_t* tag, uint16_t* type)
+{
+  *tag  = get_u16(ptr->cur + 0, ptr->be);
+  *type = get_u16(ptr->cur + 2, ptr->be);
+}
+
+
+static void
+exif_fetch_byte_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  int i;
+  uint32_t n;
+  uint8_t* p;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->cur + 8;
+
+  switch (n) {
+  case 0:
+    obj = Qnil;
+    break;
+
+  case 1:
+    obj = INT2FIX(*p);
+    break;
+
+  default:
+    p = ptr->head + get_u32(p, ptr->be);
+
+  case 2:
+  case 3:
+  case 4:
+    obj = rb_ary_new_capa(n);
+    for (i = 0; i < (int)n; i++) {
+      rb_ary_push(obj, INT2FIX(p[i]));
+    }
+    break;
+  }
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_ascii_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  uint32_t n;
+  uint8_t* p;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->cur + 8;
+
+  if (n > 4) {
+    p = ptr->head + get_u32(p, ptr->be);
+  }
+
+  obj = rb_utf8_str_new((char*)p, n);
+  rb_funcall(obj, rb_intern("strip!"), 0);
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_short_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  int i;
+  uint32_t n;
+  uint8_t* p;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->cur + 8;
+
+  switch (n) {
+  case 0:
+    obj = Qnil;
+    break;
+
+  case 1:
+    obj = INT2FIX(get_u16(p, ptr->be));
+    break;
+
+  default:
+    p = ptr->head + get_u32(p, ptr->be);
+
+  case 2:
+    obj = rb_ary_new_capa(n);
+    for (i = 0; i < (int)n; i++) {
+      rb_ary_push(obj, INT2FIX(get_u16(p, ptr->be)));
+      p += 2;
+    }
+    break;
+  }
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_long_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  int i;
+  uint32_t n;
+  uint8_t* p;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->cur + 8;
+
+  switch (n) {
+  case 0:
+    obj = Qnil;
+    break;
+
+  case 1:
+    obj = INT2FIX(get_u32(p, ptr->be));
+    break;
+
+  default:
+    p   = ptr->head + get_u32(p, ptr->be);
+    obj = rb_ary_new_capa(n);
+    for (i = 0; i < (int)n; i++) {
+      rb_ary_push(obj, INT2FIX(get_u32(p, ptr->be)));
+      p += 4;
+    }
+    break;
+  }
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_rational_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  int i;
+  uint32_t n;
+  uint8_t* p;
+  uint32_t deno;
+  uint32_t num;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->head + get_u32(ptr->cur + 8, ptr->be);
+
+  switch (n) {
+  case 0:
+    obj = Qnil;
+    break;
+
+  case 1:
+    num  = get_u32(p + 0, ptr->be);
+    deno = get_u32(p + 4, ptr->be);
+    if (num == 0 && deno == 0) {
+      deno = 1;
+    }
+    obj = rb_rational_new(INT2FIX(num), INT2FIX(deno));
+    break;
+
+  default:
+    obj = rb_ary_new_capa(n);
+    for (i = 0; i < (int)n; i++) {
+      num  = get_u32(p + 0, ptr->be);
+      deno = get_u32(p + 4, ptr->be);
+      if (num == 0 && deno == 0) {
+        deno = 1;
+      }
+      rb_ary_push(obj, rb_rational_new(INT2FIX(num), INT2FIX(deno)));
+      p += 8;
+    }
+    break;
+  }
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_undefined_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  uint32_t n;
+  uint8_t* p;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->cur + 8;
+
+  if (n > 4) {
+    p = ptr->head + get_u32(p, ptr->be);
+  }
+
+  obj = rb_enc_str_new((char*)p, n, rb_ascii8bit_encoding());
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_slong_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  int i;
+  uint32_t n;
+  uint8_t* p;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->cur + 8;
+
+  switch (n) {
+  case 0:
+    obj = Qnil;
+    break;
+
+  case 1:
+    obj = INT2FIX(get_s32(p, ptr->be));
+    break;
+
+  default:
+    p   = ptr->head + get_u32(p, ptr->be);
+    obj = rb_ary_new_capa(n);
+    for (i = 0; i < (int)n; i++) {
+      rb_ary_push(obj, INT2FIX(get_s32(p, ptr->be)));
+      p += 4;
+    }
+    break;
+  }
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_srational_data(exif_t* ptr, VALUE* dst)
+{
+  VALUE obj;
+
+  int i;
+  uint32_t n;
+  uint8_t* p;
+  uint32_t deno;
+  uint32_t num;
+
+  n = get_u32(ptr->cur + 4, ptr->be);
+  p = ptr->head + get_u32(ptr->cur + 8, ptr->be);
+
+  switch (n) {
+  case 0:
+    obj = Qnil;
+    break;
+
+  case 1:
+    num  = get_s32(p + 0, ptr->be);
+    deno = get_s32(p + 4, ptr->be);
+    if (num == 0 && deno == 0) {
+      deno = 1;
+    }
+    obj = rb_rational_new(INT2FIX(num), INT2FIX(deno));
+    break;
+
+  default:
+    obj = rb_ary_new_capa(n);
+    for (i = 0; i < (int)n; i++) {
+      num  = get_s32(p + 0, ptr->be);
+      deno = get_s32(p + 4, ptr->be);
+      if (num == 0 && deno == 0) {
+        deno = 1;
+      }
+      rb_ary_push(obj, rb_rational_new(INT2FIX(num), INT2FIX(deno)));
+      p += 8;
+    }
+    break;
+  }
+
+  *dst = obj;
+}
+
+static void
+exif_fetch_child_ifd(exif_t* ptr, tag_entry_t* tbl, size_t n, exif_t* dst)
+{
+  uint32_t off;
+
+  off = get_u32(ptr->cur + 8, ptr->be); 
+
+  dst->be       = ptr->be;
+  dst->head     = ptr->head;
+  dst->cur      = ptr->head + off;
+  dst->size     = ptr->size - off;
+  dst->tags.tbl = tbl;
+  dst->tags.n   = n;
+  dst->next     = 0;
+}
+
+static int
+exif_read(exif_t* ptr, VALUE dst)
+{
+  int ret;
+  int i;
+  uint16_t ntag;
+  uint16_t tag;
+  uint16_t type;
+  uint32_t off;
+
+  exif_t child;
+
+  VALUE key;
+  VALUE val;
+
+  ntag = get_u16(ptr->cur, ptr->be);
+  exif_increase(ptr, 2);
+
+  for (i = 0; i < ntag; i++) {
+    exif_fetch_tag_header(ptr, &tag, &type);
+
+    switch (tag) {
+    case 34665: // ExifIFDPointer
+      key = ID2SYM(rb_intern("exif"));
+      val = rb_hash_new();
+
+      exif_fetch_child_ifd(ptr, tag_exif, N(tag_exif), &child);
+      exif_read(&child, val);
+      break;
+
+    case 34853: // GPSInfoIFDPointer
+      key = ID2SYM(rb_intern("gps"));
+      val = rb_hash_new();
+
+      exif_fetch_child_ifd(ptr, tag_gps, N(tag_gps), &child);
+      exif_read(&child, val);
+      break;
+
+    case 40965: // InteroperabilityIFDPointer
+      key = ID2SYM(rb_intern("interoperability"));
+      val = rb_hash_new();
+
+      exif_fetch_child_ifd(ptr, tag_i14y, N(tag_i14y), &child);
+      exif_read(&child, val);
+      break;
+
+    default:
+      key = lookup_tag_symbol(ptr->tags.tbl, ptr->tags.n, tag);
+
+      switch (type) {
+      case 1:  // when BYTE
+        exif_fetch_byte_data(ptr, &val);
+        break;
+
+      case 2:  // when ASCII
+        exif_fetch_ascii_data(ptr, &val);
+        break;
+
+      case 3:  // when SHORT
+        exif_fetch_short_data(ptr, &val);
+        break;
+
+      case 4:  // when LONG
+        exif_fetch_long_data(ptr, &val);
+        break;
+
+      case 5:  // when RATIONAL
+        exif_fetch_rational_data(ptr, &val);
+        break;
+
+      case 7:  // when UNDEFINED
+        exif_fetch_undefined_data(ptr, &val);
+        break;
+
+      case 9:  // when SLONG
+        exif_fetch_slong_data(ptr, &val);
+        break;
+
+      case 10: // when SRATIONAL
+        exif_fetch_srational_data(ptr, &val);
+        break;
+
+      default:
+        rb_raise(decerr_klass, "invalid tag data type");
+      }
+    }
+
+    rb_hash_aset(dst, key, val);
+    exif_increase(ptr, 12);
+  }
+
+  off = get_u32(ptr->cur, ptr->be);
+  if (off != 0) {
+    ptr->cur  = ptr->head + off;
+    ptr->next = !0;
+  }
+
+  return ret;
+}
+
+#define THUMBNAIL_OFFSET    ID2SYM(rb_intern("jpeg_interchange_format"))
+#define THUMBNAIL_SIZE      ID2SYM(rb_intern("jpeg_interchange_format_length"))
+
+static VALUE
+create_exif_hash(jpeg_decode_t* ptr)
+{
+  VALUE ret;
+  jpeg_saved_marker_ptr marker;
+  exif_t exif;
+
+  ret = rb_hash_new();
+
+  for (marker = ptr->cinfo.marker_list;
+            marker != NULL; marker = marker->next) {
+
+    if (marker->data_length < 14) continue;
+    if (memcmp(marker->data, "Exif\0\0", 6)) continue;
+
+    /* 0th IFD */
+    exif_init(&exif, marker->data, marker->data_length);
+    exif_read(&exif, ret);
+
+    if (exif.next) {
+      /* when 1th IFD (tumbnail) exist */
+      VALUE info;
+      VALUE off;
+      VALUE size;
+      VALUE data;
+
+      info = rb_hash_new();
+
+      exif_read(&exif, info);
+
+      off  = rb_hash_lookup(info, THUMBNAIL_OFFSET);
+      size = rb_hash_lookup(info, THUMBNAIL_SIZE);
+
+      if (TYPE(off) == T_FIXNUM && TYPE(size) == T_FIXNUM) {
+        data = rb_enc_str_new((char*)exif.head + FIX2INT(off),
+                              FIX2INT(size), rb_ascii8bit_encoding());
+
+        rb_hash_lookup(info, THUMBNAIL_OFFSET);
+        rb_hash_lookup(info, THUMBNAIL_SIZE);
+        rb_hash_aset(info, ID2SYM(rb_intern("jpeg_interchange")), data);
+        rb_hash_aset(ret, ID2SYM(rb_intern("thumbnail")), info);
+      }
+    }
+    break;
+  }
+
+  return ret;
+}
+
 static VALUE
 create_meta(jpeg_decode_t* ptr)
 {
@@ -1178,7 +1903,7 @@ create_meta(jpeg_decode_t* ptr)
 
   /* TODO: そのうちディザをかけた場合のカラーマップをメタで返すようにする */
 
-  ret   = rb_obj_alloc( meta_klass);
+  ret   = rb_obj_alloc(meta_klass);
   cinfo = &ptr->cinfo;
 
   rb_ivar_set(ret, id_width, INT2FIX(cinfo->output_width));
@@ -1192,6 +1917,10 @@ create_meta(jpeg_decode_t* ptr)
   }
 
   rb_ivar_set(ret, id_ncompo, INT2FIX(cinfo->output_components));
+
+  if (ptr->parse_exif) {
+    rb_ivar_set(ret, id_exif, create_exif_hash(ptr));
+  }
 
   return ret;
 }
@@ -1223,6 +1952,11 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
     rb_raise(decerr_klass, "%s", ptr->err_mgr.msg);
   } else {
     jpeg_mem_src(&ptr->cinfo, jpg, jpg_sz);
+
+    if (ptr->parse_exif) {
+      jpeg_save_markers(&ptr->cinfo, JPEG_APP1, 0xFFFF);
+    }
+
     jpeg_read_header(&ptr->cinfo, TRUE);
     jpeg_calc_output_dimensions(&ptr->cinfo);
 
@@ -1326,7 +2060,7 @@ swap_cbcr(uint8_t* p, size_t size)
   int i;
   uint8_t tmp;
 
-  for (i = 0; i < size; i++) {
+  for (i = 0; i < (int)size; i++) {
     tmp  = p[1];
     p[1] = p[2];
     p[2] = tmp;
@@ -1483,7 +2217,7 @@ rb_test_image(VALUE self, VALUE data)
   } else {
     ret = Qfalse;
 
-    jpeg_mem_src(&cinfo, RSTRING_PTR(data), RSTRING_LEN(data));
+    jpeg_mem_src(&cinfo, (uint8_t*)RSTRING_PTR(data), RSTRING_LEN(data));
     jpeg_read_header(&cinfo, TRUE);
     jpeg_calc_output_dimensions(&cinfo);
   }
@@ -1526,6 +2260,7 @@ Init_jpeg()
   rb_define_attr(meta_klass, "original_colorspace", 1, 0);
   rb_define_attr(meta_klass, "output_colorspace", 1, 0);
   rb_define_attr(meta_klass, "num_components", 1, 0);
+  rb_define_attr(meta_klass, "exif", 1, 0);
 
   decerr_klass  = rb_define_class_under(module,
                                         "DecodeError", rb_eRuntimeError);
@@ -1543,10 +2278,11 @@ Init_jpeg()
       decoder_opts_ids[i] = rb_intern_const(decoder_opts_keys[i]);
   }
 
-  id_meta    = rb_intern_const("@meta");
-  id_width   = rb_intern_const("@width");
-  id_height  = rb_intern_const("@height");
-  id_orig_cs = rb_intern_const("@original_colorspace");
-  id_out_cs  = rb_intern_const("@output_colorspace");
-  id_ncompo  = rb_intern_const("@num_components");
+  id_meta       = rb_intern_const("@meta");
+  id_width      = rb_intern_const("@width");
+  id_height     = rb_intern_const("@height");
+  id_orig_cs    = rb_intern_const("@original_colorspace");
+  id_out_cs     = rb_intern_const("@output_colorspace");
+  id_ncompo     = rb_intern_const("@num_components");
+  id_exif       = rb_intern_const("@exif");
 }
