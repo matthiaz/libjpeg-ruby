@@ -4,16 +4,6 @@
  *  Copyright (C) 2015 Hiroshi Kuwagata <kgt9221@gmail.com>
  */
 
-/*
- * $Id: jpeg.c 159 2017-12-17 18:40:28Z pi $
- */
-
-/*
- * TODO
- *    libjpegのエラーハンドリングを全くやっていないので
- *    いずれ修正する事
- */
-
 #include <stdio.h>
 #include <stdint.h>
 #include <strings.h>
@@ -33,6 +23,18 @@
 #define DEFAULT_QUALITY            75
 #define DEFAULT_INPUT_COLOR_SPACE  JCS_YCbCr
 #define DEFAULT_INPUT_COMPONENTS   2
+#define DEFAULT_FLAGS              (F_NEED_META)
+
+#define F_NEED_META                0x00000001
+#define F_EXPAND_COLORMAP          0x00000002
+#define F_PARSE_EXIF               0x00000004
+#define F_APPLY_ORIENTATION        0x00000008
+#define F_DITHER                   0x00000010
+
+#define SET_FLAG(ptr, msk)         ((ptr)->flags |= (msk))
+#define CLR_FLAG(ptr, msk)         ((ptr)->flags &= ~(msk))
+#define TEST_FLAG(ptr, msk)        ((ptr)->flags & (msk))
+#define TEST_FLAG_ALL(ptr, msk)    (((ptr)->flags & (msk)) == msk)
 
 #define FMT_YUV422                 1
 #define FMT_RGB565                 2
@@ -51,6 +53,9 @@
 
 #define RUNTIME_ERROR(msg)         rb_raise(rb_eRuntimeError, (msg))
 #define ARGUMENT_ERROR(msg)        rb_raise(rb_eArgError, (msg))
+#define TYPE_ERROR(msg)            rb_raise(rb_eTypeError, (msg))
+#define RANGE_ERROR(msg)           rb_raise(rb_eRangeError, (msg))
+#define NOT_IMPLEMENTED_ERROR(msg) rb_raise(rb_eNotImpError, (msg))
 
 #define IS_COLORMAPPED(ci)         (((ci)->actual_number_of_colors > 0) &&\
                                     ((ci)->colormap != NULL) && \
@@ -76,11 +81,13 @@ static VALUE decerr_klass;
 
 static ID id_meta;
 static ID id_width;
+static ID id_stride;
 static ID id_height;
 static ID id_orig_cs;
 static ID id_out_cs;
 static ID id_ncompo;
-static ID id_exif;
+static ID id_exif_tags;
+static ID id_colormap;
 
 typedef struct {
   int tag;
@@ -273,14 +280,18 @@ static const char* decoder_opts_keys[] = {
   "do_fancy_upsampling",      // {bool}
   "do_smoothing",             // {bool}
   "dither",                   // [{str}MODE, {bool}2PASS, {int}NUM_COLORS]
+#if 0
   "use_1pass_quantizer",      // {bool}
   "use_external_colormap",    // {bool}
   "use_2pass_quantizer",      // {bool}
+#endif
   "without_meta",             // {bool}
   "expand_colormap",          // {bool}
   "scale",                    // {rational} or {float}
   "dct_method",               // {str}
-  "with_exif"                 // {bool}
+  "with_exif",                // {bool}
+  "with_exif_tags",           // {bool}
+  "orientation"               // {bool}
 };
 
 static ID decoder_opts_ids[N(decoder_opts_keys)];
@@ -293,10 +304,9 @@ typedef struct {
 } ext_error_t;
 
 typedef struct {
+  int flags;
   int format;
-  int need_meta;
-  int expand_colormap;
-  int parse_exif;
+  int orientation;
 
   J_COLOR_SPACE out_color_space;
   int scale_num;
@@ -517,8 +527,8 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
     break;
 
   case T_FLOAT:
-    scale_num   = 1000;
-    scale_denom = (int)(NUM2DBL(opts[2]) * 1000.0);
+    scale_num   = (int)(NUM2DBL(opts[2]) * 1000.0);
+    scale_denom = 1000;
     break;
 
   case T_RATIONAL:
@@ -585,6 +595,28 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
   jpeg_suppress_tables(&ptr->cinfo, TRUE);
 }
 
+/**
+ * initialize encoder object
+ *
+ * @overload initialize(width, height, opts)
+ *
+ *   @param width [Integer] width of input image (px)
+ *   @param height [Integer] height of input image (px)
+ *   @param opts [Hash] options to initialize object
+ *
+ *   @option opts [Symbol] :pixel_format
+ *     specifies the format of the input image. possible values are:
+ *     YUV422 YUYV RGB565 RGB RGB24 BGR BGR24 YUV444 YCbCr
+ *     RGBX RGB32 BGRX BGR32 GRAYSCALE
+ *
+ *   @option opts [Integer] :quality
+ *     specifies the quality of the compressed image.
+ *     You can specify from 0 (lowest) to 100 (best).
+ *
+ *   @option opts [Symbol] :dct_method
+ *     specifies how encoding is handled. possible values are:
+ *     FASTEST ISLOW IFAST FLOAT
+ */
 static VALUE
 rb_encoder_initialize(int argc, VALUE *argv, VALUE self)
 {
@@ -771,6 +803,15 @@ do_encode(jpeg_encode_t* ptr, uint8_t* data)
   return ret;
 }
 
+/**
+ * encode data
+ *
+ * @overload encode(raw)
+ *
+ *   @param raw [String]  raw image data to encode.
+ *
+ *   @return [String] encoded JPEG data.
+ */
 static VALUE
 rb_encoder_encode(VALUE self, VALUE data)
 {
@@ -861,10 +902,9 @@ rb_decoder_alloc(VALUE self)
   ptr = ALLOC(jpeg_decode_t);
   memset(ptr, 0, sizeof(*ptr));
 
+  ptr->flags                    = DEFAULT_FLAGS;
   ptr->format                   = FMT_RGB;
-  ptr->need_meta                = !0;
-  ptr->expand_colormap          = 0;
-  ptr->parse_exif               = 0;
+  ptr->orientation              = 0;
 
   ptr->out_color_space          = JCS_RGB;
 
@@ -905,10 +945,14 @@ eval_decoder_opt_pixel_format(jpeg_decode_t* ptr, VALUE opt)
       color_space = JCS_YCbCr;
       components  = 3;
 
+      NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
+
     } else if (EQ_STR(opt, "RGB565")) {
       format      = FMT_RGB565;
       color_space = JCS_RGB;
       components  = 3;
+
+      NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
 
     } else if (EQ_STR(opt, "GRAYSCALE")) {
       format      = FMT_GRAYSCALE;
@@ -958,12 +1002,13 @@ eval_decoder_opt_output_gamma(jpeg_decode_t* ptr, VALUE opt)
     // Nothing
     break;
 
+  case T_FIXNUM:
   case T_FLOAT:
     ptr->output_gamma = NUM2DBL(opt);
     break;
 
   default:
-    ARGUMENT_ERROR("Unsupportd :output_gamma option value.");
+    TYPE_ERROR("Unsupportd :output_gamma option value.");
     break;
   }
 }
@@ -993,7 +1038,7 @@ eval_decoder_opt_dither( jpeg_decode_t* ptr, VALUE opt)
 
   if (opt != Qundef) {
     if (TYPE(opt) != T_ARRAY) {
-      ARGUMENT_ERROR("Unsupportd :dither option value.");
+      TYPE_ERROR("Unsupportd :dither option value.");
     }
 
     if (RARRAY_LEN(opt) != 3) {
@@ -1024,12 +1069,21 @@ eval_decoder_opt_dither( jpeg_decode_t* ptr, VALUE opt)
 
     if (TYPE(n_col) == T_FIXNUM) {
       ptr->desired_number_of_colors = FIX2INT(n_col);
+
+      if (ptr->desired_number_of_colors < 8 ||
+          ptr->desired_number_of_colors > 256) {
+        RANGE_ERROR("number of dithered colors shall be from 8 to 256.");
+      } 
+
     } else {
-      ARGUMENT_ERROR( "number of dithered colors is illeagal value.");
+      TYPE_ERROR("number of dithered colors is illeagal value.");
     }
+
+    SET_FLAG(ptr, F_DITHER);
   }
 }
 
+#if 0
 static void
 eval_decoder_opt_use_1pass_quantizer(jpeg_decode_t* ptr, VALUE opt)
 {
@@ -1068,12 +1122,17 @@ eval_decoder_opt_use_2pass_quantizer(jpeg_decode_t* ptr, VALUE opt)
     }
   }
 }
+#endif
 
 static void
 eval_decoder_opt_without_meta(jpeg_decode_t* ptr, VALUE opt)
 {
   if (opt != Qundef) {
-    ptr->need_meta = RTEST(opt);
+    if (RTEST(opt)) {
+      CLR_FLAG(ptr, F_NEED_META);
+    } else {
+      SET_FLAG(ptr, F_NEED_META);
+    }
   }
 }
 
@@ -1081,7 +1140,11 @@ static void
 eval_decoder_opt_expand_colormap(jpeg_decode_t* ptr, VALUE opt)
 {
   if (opt != Qundef) {
-    ptr->expand_colormap = RTEST(opt);
+    if (RTEST(opt)) {
+      SET_FLAG(ptr, F_EXPAND_COLORMAP);
+    } else {
+      CLR_FLAG(ptr, F_EXPAND_COLORMAP);
+    }
   }
 }
 
@@ -1094,8 +1157,8 @@ eval_decoder_opt_scale(jpeg_decode_t* ptr, VALUE opt)
     break;
 
   case T_FLOAT:
-    ptr->scale_num   = 1000;
-    ptr->scale_denom = (int)(NUM2DBL(opt) * 1000.0);
+    ptr->scale_num   = (int)(NUM2DBL(opt) * 1000.0);
+    ptr->scale_denom = 1000;
     break;
 
   case T_RATIONAL:
@@ -1103,8 +1166,16 @@ eval_decoder_opt_scale(jpeg_decode_t* ptr, VALUE opt)
     ptr->scale_denom = FIX2INT(rb_rational_den(opt));
     break;
 
+  case T_ARRAY:
+    if (RARRAY_LEN(opt) != 2) {
+      ARGUMENT_ERROR("invalid length");
+    }
+    ptr->scale_num   = FIX2INT(RARRAY_AREF(opt, 0));
+    ptr->scale_denom = FIX2INT(RARRAY_AREF(opt, 1));
+    break;
+
   default:
-    ARGUMENT_ERROR("Unsupportd :exapnd_colormap option value.");
+    TYPE_ERROR("Unsupportd :exapnd_colormap option value.");
     break;
   }
 }
@@ -1132,10 +1203,26 @@ eval_decoder_opt_dct_method(jpeg_decode_t* ptr, VALUE opt)
 }
 
 static void
-eval_decoder_opt_with_exif(jpeg_decode_t* ptr, VALUE opt)
+eval_decoder_opt_with_exif_tags(jpeg_decode_t* ptr, VALUE opt)
 {
   if (opt != Qundef) {
-    ptr->parse_exif = RTEST(opt);
+    if (RTEST(opt)) {
+      SET_FLAG(ptr, F_PARSE_EXIF);
+    } else {
+      CLR_FLAG(ptr, F_PARSE_EXIF);
+    }
+  }
+}
+
+static void
+eval_decoder_opt_orientation(jpeg_decode_t* ptr, VALUE opt)
+{
+  if (opt != Qundef) {
+    if (RTEST(opt)) {
+      SET_FLAG(ptr, F_APPLY_ORIENTATION);
+    } else {
+      CLR_FLAG(ptr, F_APPLY_ORIENTATION);
+    }
   }
 }
 
@@ -1157,16 +1244,68 @@ set_decoder_context( jpeg_decode_t* ptr, VALUE opt)
   eval_decoder_opt_do_fancy_upsampling(ptr, opts[2]);
   eval_decoder_opt_do_smoothing(ptr, opts[3]);
   eval_decoder_opt_dither(ptr, opts[4]);
+#if 0
   eval_decoder_opt_use_1pass_quantizer(ptr, opts[5]);
   eval_decoder_opt_use_external_colormap(ptr, opts[6]);
   eval_decoder_opt_use_2pass_quantizer(ptr, opts[7]);
-  eval_decoder_opt_without_meta(ptr, opts[8]);
-  eval_decoder_opt_expand_colormap(ptr, opts[9]);
-  eval_decoder_opt_scale(ptr, opts[10]);
-  eval_decoder_opt_dct_method(ptr, opts[11]);
-  eval_decoder_opt_with_exif(ptr, opts[12]);
+#endif
+  eval_decoder_opt_without_meta(ptr, opts[5]);
+  eval_decoder_opt_expand_colormap(ptr, opts[6]);
+  eval_decoder_opt_scale(ptr, opts[7]);
+  eval_decoder_opt_dct_method(ptr, opts[8]);
+  eval_decoder_opt_with_exif_tags(ptr, opts[9]);
+  eval_decoder_opt_with_exif_tags(ptr, opts[10]);
+  eval_decoder_opt_orientation(ptr, opts[11]);
 }
 
+/**
+ * initialize decoder object
+ *
+ * @overload initialize(opts)
+ *
+ *   @param opts [Hash] options to initialize object
+ *
+ *   @option opts [Symbol] :pixel_format
+ *     specifies the format of the output image. possible values are:
+ *     YUV422 YUYV RGB565 RGB RGB24 BGR BGR24 YUV444 YCbCr
+ *     RGBX RGB32 BGRX BGR32 GRAYSCALE
+ *
+ *   @option opts [Float] :output_gamma
+ *
+ *   @option opts [Boolean] :fancy_upsampling
+ *
+ *   @option opts [Boolean] :do_smoothing
+ *
+ *   @option opts [Array] :dither
+ *     specifies dithering parameters. A 3-elements array.
+ *     specify the dither type as a string for the 1st element,
+ *     whether to use 2-pass quantize for the 2nd element as a boolean,
+ *     and the number of colors used for the 3rd element as an integer
+ *     from 16 to 256.
+ *
+ *   @option opts [Boolean] :without_meta
+ *     specifies whether or not to include meta information in the
+ *     output data. If true, no meta-information is output.
+ *
+ *   @option opts [Boolean] :expand_colormap
+ *     specifies whether to expand the color map. If dither is specified,
+ *     the output will be a color number of 1 byte per pixel, but if this
+ *     option is set to true, the output will be expanded to color information.
+ *
+ *   @option opts [Ratioanl] :scale
+ *
+ *   @option opts [Symbol] :dct_method
+ *     specifies how decoding is handled. possible values are:
+ *     FASTEST ISLOW IFAST FLOAT
+ *
+ *   @option opts [Boolean] :with_exif_tags
+ *     specifies whether to include Exif tag information in the output data.
+ *     set this option to true to parse the Exif tag information and include
+ *     it in the meta information output.
+ *
+ *   @option opts [Boolean] :with_exif
+ *     alias to :with_exif_tags option.
+ */
 static VALUE
 rb_decoder_initialize( int argc, VALUE *argv, VALUE self)
 {
@@ -1215,8 +1354,6 @@ rb_decoder_set(VALUE self, VALUE opt)
 
   return Qtrue;
 }
-
-
 
 static VALUE
 get_colorspace_str( J_COLOR_SPACE cs)
@@ -1396,7 +1533,7 @@ exif_init(exif_t* ptr, uint8_t* src, size_t size)
   uint32_t off;
 
   /*
-   * Check Exif idntifier
+   * Check Exif identifier
    */
   if (memcmp(src, "Exif\0\0", 6)) {
     rb_raise(decerr_klass, "invalid exif identifier");
@@ -1847,7 +1984,7 @@ exif_read(exif_t* ptr, VALUE dst)
 #define THUMBNAIL_SIZE      ID2SYM(rb_intern("jpeg_interchange_format_length"))
 
 static VALUE
-create_exif_hash(jpeg_decode_t* ptr)
+create_exif_tags_hash(jpeg_decode_t* ptr)
 {
   VALUE ret;
   jpeg_saved_marker_ptr marker;
@@ -1895,18 +2032,157 @@ create_exif_hash(jpeg_decode_t* ptr)
   return ret;
 }
 
+static void
+pick_exif_orientation(jpeg_decode_t* ptr)
+{
+  jpeg_saved_marker_ptr marker;
+  int o9n;
+  uint8_t* p;
+  int be;
+  uint32_t off;
+  int i;
+  int n;
+
+  o9n = 0;
+
+  for (marker = ptr->cinfo.marker_list;
+            marker != NULL; marker = marker->next) {
+
+    if (marker->data_length < 14) continue;
+
+    p = marker->data;
+
+    /*
+     * check Exif identifier
+     */
+    if (memcmp(p, "Exif\0\0", 6)) continue;
+
+    /*
+     * check endian marker
+     */
+    if (!memcmp(p + 6, "MM", 2)) {
+      be = !0;
+
+    } else if (!memcmp(p + 6, "II", 2)) {
+      be = 0;
+
+    } else {
+      continue;
+    }
+
+    /*
+     * check TIFF identifier
+     */
+    if (get_u16(p + 8, be) != 0x002a) continue;
+
+    /*
+     * set 0th IFD address
+     */
+    off = get_u32(p + 10, be);
+    if (off < 8 || off >= marker->data_length - 6) continue;
+
+    p += (6 + off);
+
+    /* ここまでくればAPP1がExifタグなので
+     * 0th IFDをなめてOrientationタグを探す */
+
+    n = get_u16(p, be);
+    p += 2;
+
+    for (i = 0; i < n; i++) {
+      int tag;
+      int type;
+      int num;
+
+      tag  = get_u16(p + 0, be);
+      type = get_u16(p + 2, be);
+      num  = get_u32(p + 4, be);
+
+      if (tag == 0x0112) {
+        if (type == 3 && num == 1) {
+          o9n = get_u16(p + 8, be);
+          goto loop_out;
+
+        } else {
+          fprintf(stderr,
+                  "Illeagal orientation tag found [type:%d, num:%d]\n",
+                  type,
+                  num);
+        }
+      }
+
+      p += 12;
+    }
+  }
+  loop_out:
+
+  if (o9n > 0) {
+    ptr->orientation = o9n;
+  }
+}
+
+static VALUE
+create_colormap(jpeg_decode_t* ptr)
+{
+  VALUE ret;
+  struct jpeg_decompress_struct* cinfo;
+  JSAMPARRAY map;
+  int i;   // volatileを外すとaarch64のgcc6でクラッシュする場合がある
+  uint32_t c;
+
+  cinfo = &ptr->cinfo;
+  ret   = rb_ary_new_capa(cinfo->actual_number_of_colors);
+  map   = cinfo->colormap;
+
+  switch (cinfo->out_color_components) {
+  case 1:
+    for (i = 0; i < cinfo->actual_number_of_colors; i++) {
+      c = map[0][i];
+      rb_ary_push(ret, INT2FIX(c));
+    }
+    break;
+
+  case 2:
+    for (i = 0; i < cinfo->actual_number_of_colors; i++) {
+      c = (map[0][i] << 8) | (map[1][i] << 0);
+      rb_ary_push(ret, INT2FIX(c));
+    }
+    break;
+
+  case 3:
+    for (i = 0; i < cinfo->actual_number_of_colors; i++) {
+      c = (map[0][i] << 16) | (map[1][i] << 8) | (map[2][i] << 0);
+
+      rb_ary_push(ret, INT2FIX(c));
+    }
+    break;
+
+  default:
+    RUNTIME_ERROR("this number of components is not implemented yet");
+  }
+
+  return ret;
+}
+
+static VALUE
+rb_meta_exif_tags(VALUE self)
+{
+  return rb_ivar_get(self, id_exif_tags);
+}
+
 static VALUE
 create_meta(jpeg_decode_t* ptr)
 {
   VALUE ret;
   struct jpeg_decompress_struct* cinfo;
+  int stride;
 
-  /* TODO: そのうちディザをかけた場合のカラーマップをメタで返すようにする */
-
-  ret   = rb_obj_alloc(meta_klass);
-  cinfo = &ptr->cinfo;
+  ret    = rb_obj_alloc(meta_klass);
+  cinfo  = &ptr->cinfo;
+  stride = cinfo->output_width * cinfo->output_components;
 
   rb_ivar_set(ret, id_width, INT2FIX(cinfo->output_width));
+  rb_ivar_set(ret, id_stride, INT2FIX(stride));
   rb_ivar_set(ret, id_height, INT2FIX(cinfo->output_height));
   rb_ivar_set(ret, id_orig_cs, get_colorspace_str(cinfo->jpeg_color_space));
 
@@ -1916,12 +2192,26 @@ create_meta(jpeg_decode_t* ptr)
     rb_ivar_set(ret, id_out_cs, get_colorspace_str(cinfo->out_color_space));
   }
 
-  rb_ivar_set(ret, id_ncompo, INT2FIX(cinfo->output_components));
-
-  if (ptr->parse_exif) {
-    rb_ivar_set(ret, id_exif, create_exif_hash(ptr));
+  if (TEST_FLAG_ALL(ptr, F_DITHER | F_EXPAND_COLORMAP)) {
+    rb_ivar_set(ret, id_ncompo, INT2FIX(cinfo->out_color_components));
+  } else {
+    rb_ivar_set(ret, id_ncompo, INT2FIX(cinfo->output_components));
   }
 
+  if (TEST_FLAG(ptr, F_APPLY_ORIENTATION)) {
+    pick_exif_orientation(ptr);
+  }
+
+  if (TEST_FLAG(ptr, F_PARSE_EXIF)) {
+    rb_ivar_set(ret, id_exif_tags, create_exif_tags_hash(ptr));
+    rb_define_singleton_method(ret, "exif_tags", rb_meta_exif_tags, 0);
+    rb_define_singleton_method(ret, "exif", rb_meta_exif_tags, 0);
+  } 
+
+  if (TEST_FLAG(ptr, F_DITHER)) {
+    rb_ivar_set(ret, id_colormap, create_colormap(ptr));
+  }
+  
   return ret;
 }
 
@@ -1933,7 +2223,7 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
   switch (ptr->format) {
   case FMT_YUV422:
   case FMT_RGB565:
-    RUNTIME_ERROR( "Not implement");
+    NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
     break;
   }
 
@@ -1953,7 +2243,7 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
   } else {
     jpeg_mem_src(&ptr->cinfo, jpg, jpg_sz);
 
-    if (ptr->parse_exif) {
+    if (TEST_FLAG(ptr, F_PARSE_EXIF | F_APPLY_ORIENTATION)) {
       jpeg_save_markers(&ptr->cinfo, JPEG_APP1, 0xFFFF);
     }
 
@@ -1968,6 +2258,15 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
   return ret;
 }
 
+/**
+ * read meta data
+ *
+ * @overload read_header(jpeg)
+ *
+ *   @param jpeg [String] input data.
+ *
+ *   @return [JPEG::Meta] metadata.
+ */
 static VALUE
 rb_decoder_read_header(VALUE self, VALUE data)
 {
@@ -2018,7 +2317,7 @@ expand_colormap(struct jpeg_decompress_struct* cinfo, uint8_t* src)
    */
 
   VALUE ret;
-  int i;
+  volatile int i;   // volatileを外すとaarch64のgcc6でクラッシュする場合がある
   int n;
   uint8_t* dst;
   JSAMPARRAY map;
@@ -2035,6 +2334,15 @@ expand_colormap(struct jpeg_decompress_struct* cinfo, uint8_t* src)
     }
     break;
 
+  case 2:
+    for (i = 0; i < n; i++) {
+      dst[0] = map[0][src[i]];
+      dst[1] = map[1][src[i]];
+
+      dst += 2;
+    }
+    break;
+
   case 3:
     for (i = 0; i < n; i++) {
       dst[0] = map[0][src[i]];
@@ -2046,7 +2354,7 @@ expand_colormap(struct jpeg_decompress_struct* cinfo, uint8_t* src)
     break;
 
   default:
-    RUNTIME_ERROR("Really?");
+    RUNTIME_ERROR("this number of components is not implemented yet");
   }
 
   rb_str_set_len(ret, n * cinfo->out_color_components);
@@ -2065,6 +2373,11 @@ swap_cbcr(uint8_t* p, size_t size)
     p[1] = p[2];
     p[2] = tmp;
   }
+}
+
+static VALUE
+apply_orientation(jpeg_decode_t* ptr, VALUE img)
+{
 }
 
 static VALUE
@@ -2087,7 +2400,7 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
   switch (ptr->format) {
   case FMT_YUV422:
   case FMT_RGB565:
-    RUNTIME_ERROR( "Not implement");
+    NOT_IMPLEMENTED_ERROR( "not implemented colorspace");
     break;
 
   case FMT_GRAYSCALE:
@@ -2113,6 +2426,11 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
 
     } else {
       jpeg_mem_src(cinfo, jpg, jpg_sz);
+
+      if (TEST_FLAG(ptr, F_PARSE_EXIF | F_APPLY_ORIENTATION)) {
+        jpeg_save_markers(&ptr->cinfo, JPEG_APP1, 0xFFFF);
+      }
+
       jpeg_read_header(cinfo, TRUE);
 
       cinfo->raw_data_out              = FALSE;
@@ -2141,7 +2459,6 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
       ret    = rb_str_buf_new(raw_sz);
       raw    = (uint8_t*)RSTRING_PTR(ret);
 
-
       while (cinfo->output_scanline < cinfo->output_height) {
         for (i = 0, j = cinfo->output_scanline; i < UNIT_LINES; i++, j++) {
           array[i] = raw + (j * stride);
@@ -2150,14 +2467,19 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
         jpeg_read_scanlines(cinfo, array, UNIT_LINES);
       }
 
-      if (ptr->expand_colormap && IS_COLORMAPPED( cinfo)) {
+      if (TEST_FLAG(ptr, F_EXPAND_COLORMAP) && IS_COLORMAPPED(cinfo)) {
         ret = expand_colormap(cinfo, raw);
       } else {
-        rb_str_set_len( ret, raw_sz);
+        rb_str_set_len(ret, raw_sz);
       }
 
-      if (ptr->need_meta) add_meta(ret, ptr);
       if (ptr->format == FMT_YVU) swap_cbcr(raw, raw_sz);
+
+      if (TEST_FLAG(ptr, F_NEED_META)) add_meta(ret, ptr);
+
+      if (TEST_FLAG(ptr, F_APPLY_ORIENTATION)) {
+        ret = apply_orientation(ptr, ret);
+      }
 
       jpeg_finish_decompress(cinfo);
       jpeg_destroy_decompress(&ptr->cinfo);
@@ -2170,6 +2492,15 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
   return ret;
 }
 
+/**
+ * decode JPEG data
+ *
+ * @overload decode(jpeg)
+ *
+ *   @param jpeg [String]  JPEG data to decode.
+ *
+ *   @return [String] decoded raw image data.
+ */
 static VALUE
 rb_decoder_decode(VALUE self, VALUE data)
 {
@@ -2256,11 +2587,12 @@ Init_jpeg()
 
   meta_klass    = rb_define_class_under(module, "Meta", rb_cObject);
   rb_define_attr(meta_klass, "width", 1, 0);
+  rb_define_attr(meta_klass, "stride", 1, 0);
   rb_define_attr(meta_klass, "height", 1, 0);
   rb_define_attr(meta_klass, "original_colorspace", 1, 0);
   rb_define_attr(meta_klass, "output_colorspace", 1, 0);
   rb_define_attr(meta_klass, "num_components", 1, 0);
-  rb_define_attr(meta_klass, "exif", 1, 0);
+  rb_define_attr(meta_klass, "colormap", 1, 0);
 
   decerr_klass  = rb_define_class_under(module,
                                         "DecodeError", rb_eRuntimeError);
@@ -2278,11 +2610,13 @@ Init_jpeg()
       decoder_opts_ids[i] = rb_intern_const(decoder_opts_keys[i]);
   }
 
-  id_meta       = rb_intern_const("@meta");
-  id_width      = rb_intern_const("@width");
-  id_height     = rb_intern_const("@height");
-  id_orig_cs    = rb_intern_const("@original_colorspace");
-  id_out_cs     = rb_intern_const("@output_colorspace");
-  id_ncompo     = rb_intern_const("@num_components");
-  id_exif       = rb_intern_const("@exif");
+  id_meta      = rb_intern_const("@meta");
+  id_width     = rb_intern_const("@width");
+  id_stride    = rb_intern_const("@stride");
+  id_height    = rb_intern_const("@height");
+  id_orig_cs   = rb_intern_const("@original_colorspace");
+  id_out_cs    = rb_intern_const("@output_colorspace");
+  id_ncompo    = rb_intern_const("@num_components");
+  id_exif_tags = rb_intern_const("@exif_tags");
+  id_colormap  = rb_intern_const("@colormap");
 }

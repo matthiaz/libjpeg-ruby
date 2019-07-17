@@ -12,6 +12,7 @@ Gem::Specification.new do |spec|
   spec.summary       = %q{libjpeg interface for ruby}
   spec.description   = %q{libjpeg interface for ruby}
   spec.homepage      = "https://github.com/kwgt/libjpeg-ruby"
+  spec.license       = "MIT"
 
   if spec.respond_to?(:metadata)
     spec.metadata["homepage_uri"] = spec.homepage

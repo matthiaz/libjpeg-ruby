@@ -1,0 +1,8 @@
+*.gem
+.rbenv-gemsets
+.ruby-version
+/.config
+/pkg/
+/doc/
+/tmp/
+/.yardoc/
