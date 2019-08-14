@@ -905,8 +905,19 @@ static void
 rb_decoder_free(void* ptr)
 {
   //jpeg_destroy_decompress(&(((jpeg_decode_t*)ptr)->cinfo));
-
   free(ptr);
+}
+
+static void
+rb_decoder_mark(void* _ptr)
+{
+  jpeg_decode_t* ptr;
+
+  ptr = (jpeg_decode_t*)_ptr; 
+
+  if (ptr->orientation.buf != Qnil) {
+    rb_gc_mark(ptr->orientation.buf);
+  }
 }
 
 static void
@@ -983,7 +994,7 @@ rb_decoder_alloc(VALUE self)
   ptr->orientation.value        = 0;
   ptr->orientation.buf          = Qnil;
 
-  return Data_Wrap_Struct(decoder_klass, 0, rb_decoder_free, ptr);
+  return Data_Wrap_Struct(decoder_klass, rb_decoder_mark, rb_decoder_free, ptr);
 }
 
 static void
