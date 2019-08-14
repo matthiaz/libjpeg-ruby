@@ -51,6 +51,7 @@ IO.binwrite("test.bgr", raw)
 | :scale | Rational or Float | T.B.D |
 | :dct_method | String or Symbol | T.B.D |
 | :with_exif | Boolean | Specify whether to read Exif tag. When set to true, the content of Exif tag will included in the meta information. |
+| :orientation | Boolean | Specify whether to parse Exif orientation. When set to true, apply orientation for decode result. |
 
 #### supported output format
 RGB RGB24 YUV422 YUYV RGB565 YUV444 YCbCr BGR BGR24 RGBX RGB32 BGRX BGR32 
@@ -75,4 +76,5 @@ IO.binwrite("test.jpg", enc << IO.binread("test.raw"))
 | :quality | Integer | encode quality (0-100) |
 | :scale | Rational or Float | |
 | :dct_method | String or Symbol | T.B.D |
+| :orientation | Integer | Specify Exif orientation value (1-8). |
 
