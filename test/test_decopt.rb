@@ -808,14 +808,75 @@ class TestDecodeOptions < Test::Unit::TestCase
     }
 
     dat = (DATA_DIR + "DSC_0215_small.JPG").binread
-
-    meta  = assert_nothing_raised {dec.read_header(dat)}
+    met = assert_nothing_raised {dec.read_header(dat)}
 
     if val
-      assert_respond_to(meta, :exif_tags)
-      assert_kind_of(Hash, meta.exif_tags)
+      assert_respond_to(met, :exif_tags)
+      assert_kind_of(Hash, met.exif_tags)
     else
-      assert_not_respond_to(meta, :exif_tags)
+      assert_not_respond_to(met, :exif_tags)
+    end
+  end
+
+  #
+  # orientation (decode)
+  #
+
+  data("true"   => true, 
+       "false"  => false,
+       "int"    => 1,         # as true
+       "float"  => 1.0,       # as true
+       "nil"    => nil,       # as false
+       "symbol" => :yes,      # as true
+       "string" => "yes",     # as true
+       "array"  => [],        # as true
+       "hash"   => {})        # as true
+
+  test "orientation (decode)" do |val|
+    dec = assert_nothing_raised {
+      JPEG::Decoder.new(:orientation => val)
+    }
+
+    dat = (DATA_DIR + "orientation.jpg").binread
+    met = assert_nothing_raised {(dec << dat).meta}
+
+    if val
+      assert_equal(met.width, 160)
+      assert_equal(met.height, 240)
+    else
+      assert_equal(met.width, 240)
+      assert_equal(met.height, 160)
+    end
+  end
+
+  #
+  # orientation (read header)
+  #
+
+  data("true"   => true, 
+       "false"  => false,
+       "int"    => 1,         # as true
+       "float"  => 1.0,       # as true
+       "nil"    => nil,       # as false
+       "symbol" => :yes,      # as true
+       "string" => "yes",     # as true
+       "array"  => [],        # as true
+       "hash"   => {})        # as true
+
+  test "orientation (decode)" do |val|
+    dec = assert_nothing_raised {
+      JPEG::Decoder.new(:orientation => val)
+    }
+
+    dat = (DATA_DIR + "orientation.jpg").binread
+    met = assert_nothing_raised {dec.read_header(dat)}
+
+    if val
+      assert_equal(met.width, 160)
+      assert_equal(met.height, 240)
+    else
+      assert_equal(met.width, 240)
+      assert_equal(met.height, 160)
     end
   end
 end

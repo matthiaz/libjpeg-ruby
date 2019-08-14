@@ -1,3 +1,3 @@
 module JPEG
-  VERSION = "0.7.2d"
+  VERSION = "0.7.2"
 end

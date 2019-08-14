@@ -256,7 +256,8 @@ static const char* encoder_opts_keys[] = {
   "pixel_format",             // {str}
   "quality",                  // {integer}
   "scale",                    // {rational} or {float}
-  "dct_method"                // {str}
+  "dct_method",               // {str}
+  "orientation"               // {integer}
 };
 
 static ID encoder_opts_ids[N(encoder_opts_keys)];
@@ -274,6 +275,8 @@ typedef struct {
 
   JSAMPARRAY array;
   JSAMPROW rows;
+
+  int orientation;
 } jpeg_encode_t;
 
 static const char* decoder_opts_keys[] = {
@@ -419,8 +422,6 @@ rb_encoder_alloc(VALUE self)
   ptr = ALLOC(jpeg_encode_t);
   memset(ptr, 0, sizeof(*ptr));
 
-  ptr->dct_method = JDCT_FASTEST;
-
   return Data_Wrap_Struct(encoder_klass, 0, rb_encoder_free, ptr);
 }
 
@@ -564,6 +565,25 @@ set_encoder_context(jpeg_encode_t* ptr, int wd, int ht, VALUE opt)
 
   } else {
     ARGUMENT_ERROR("Unsupportd :dct_method option value.");
+  }
+
+  /*
+   * eval orientation option
+   */
+  switch (TYPE(opts[4])) {
+  case T_UNDEF:
+    ptr->orientation = 0;
+    break;
+
+  case T_FIXNUM:
+    ptr->orientation = FIX2INT(opts[4]);
+    if (ptr->orientation < 1 || ptr->orientation > 8) {
+      RANGE_ERROR("orientation is ouf range");
+    } 
+    break;
+
+  default:
+    ARGUMENT_ERROR("Unsupportd :orientation option value.");
   }
 
   /*
@@ -767,6 +787,34 @@ push_rows(jpeg_encode_t* ptr, uint8_t* data, int nrow)
   return ret;
 }
 
+static void
+put_exif_tags(jpeg_encode_t* ptr)
+{
+  uint8_t data[] = {
+    /* Exif header */
+    'E',  'x',  'i',  'f', 0x00, 0x00,
+    'M',  'M',
+    0x00, 0x2a,
+    0x00, 0x00, 0x00, 0x08,
+    0x00, 0x01,
+
+    /* orieatation */
+    0x01, 0x12,
+    0x00, 0x03,
+    0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00,
+    0x00, 0x00,
+
+    /* end mark */
+    0x00, 0x00, 0x00, 0x00,
+  };
+
+  data[24] = (ptr->orientation >> 8) & 0xff;
+  data[25] = (ptr->orientation >> 0) & 0xff;
+
+  jpeg_write_marker(&ptr->cinfo, JPEG_APP1, data, sizeof(data));
+}
+
 static VALUE
 do_encode(jpeg_encode_t* ptr, uint8_t* data)
 {
@@ -778,10 +826,13 @@ do_encode(jpeg_encode_t* ptr, uint8_t* data)
 
   buf = NULL;
 
-
   jpeg_mem_dest(&ptr->cinfo, &buf, &buf_size); 
 
   jpeg_start_compress(&ptr->cinfo, TRUE);
+
+  if (ptr->orientation != 0) {
+    put_exif_tags(ptr);
+  }
 
   while (ptr->cinfo.next_scanline < ptr->cinfo.image_height) {
     nrow = ptr->cinfo.image_height - ptr->cinfo.next_scanline;
