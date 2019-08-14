@@ -34,7 +34,7 @@
 #define SET_FLAG(ptr, msk)         ((ptr)->flags |= (msk))
 #define CLR_FLAG(ptr, msk)         ((ptr)->flags &= ~(msk))
 #define TEST_FLAG(ptr, msk)        ((ptr)->flags & (msk))
-#define TEST_FLAG_ALL(ptr, msk)    (((ptr)->flags & (msk)) == msk)
+#define TEST_FLAG_ALL(ptr, msk)    (((ptr)->flags & (msk)) == (msk))
 
 #define FMT_YUV422                 1
 #define FMT_RGB565                 2
@@ -50,6 +50,8 @@
 #define JPEG_APP1                  0xe1   /* Exif marker */
 
 #define N(x)                       (sizeof(x)/sizeof(*x))
+#define SWAP(a,b,t) \
+        do {t c; c = (a); (a) = (b); (b) = c;} while (0)
 
 #define RUNTIME_ERROR(msg)         rb_raise(rb_eRuntimeError, (msg))
 #define ARGUMENT_ERROR(msg)        rb_raise(rb_eArgError, (msg))
@@ -306,7 +308,6 @@ typedef struct {
 typedef struct {
   int flags;
   int format;
-  int orientation;
 
   J_COLOR_SPACE out_color_space;
   int scale_num;
@@ -327,6 +328,11 @@ typedef struct {
 
   struct jpeg_decompress_struct cinfo;
   ext_error_t err_mgr;
+
+  struct {
+    int value;
+    VALUE buf;
+  } orientation;
 } jpeg_decode_t;
 
 
@@ -904,7 +910,6 @@ rb_decoder_alloc(VALUE self)
 
   ptr->flags                    = DEFAULT_FLAGS;
   ptr->format                   = FMT_RGB;
-  ptr->orientation              = 0;
 
   ptr->out_color_space          = JCS_RGB;
 
@@ -923,6 +928,9 @@ rb_decoder_alloc(VALUE self)
   ptr->enable_1pass_quant       = FALSE;
   ptr->enable_external_quant    = FALSE;
   ptr->enable_2pass_quant       = FALSE;
+
+  ptr->orientation.value        = 0;
+  ptr->orientation.buf          = Qnil;
 
   return Data_Wrap_Struct(decoder_klass, 0, rb_decoder_free, ptr);
 }
@@ -2116,9 +2124,7 @@ pick_exif_orientation(jpeg_decode_t* ptr)
   }
   loop_out:
 
-  if (o9n > 0) {
-    ptr->orientation = o9n;
-  }
+  ptr->orientation.value = (o9n >= 1 && o9n <= 8)? (o9n - 1): 0;
 }
 
 static VALUE
@@ -2175,15 +2181,27 @@ create_meta(jpeg_decode_t* ptr)
 {
   VALUE ret;
   struct jpeg_decompress_struct* cinfo;
+  int width;
+  int height;
   int stride;
 
   ret    = rb_obj_alloc(meta_klass);
   cinfo  = &ptr->cinfo;
+
+  if (TEST_FLAG(ptr, F_APPLY_ORIENTATION) && (ptr->orientation.value & 4)) {
+    width  = cinfo->output_height;
+    height = cinfo->output_width;
+  } else {
+    width  = cinfo->output_width;
+    height = cinfo->output_height;
+  }
+
   stride = cinfo->output_width * cinfo->output_components;
 
-  rb_ivar_set(ret, id_width, INT2FIX(cinfo->output_width));
+  rb_ivar_set(ret, id_width, INT2FIX(width));
   rb_ivar_set(ret, id_stride, INT2FIX(stride));
-  rb_ivar_set(ret, id_height, INT2FIX(cinfo->output_height));
+  rb_ivar_set(ret, id_height, INT2FIX(height));
+
   rb_ivar_set(ret, id_orig_cs, get_colorspace_str(cinfo->jpeg_color_space));
 
   if (ptr->format == FMT_YVU) {
@@ -2196,10 +2214,6 @@ create_meta(jpeg_decode_t* ptr)
     rb_ivar_set(ret, id_ncompo, INT2FIX(cinfo->out_color_components));
   } else {
     rb_ivar_set(ret, id_ncompo, INT2FIX(cinfo->output_components));
-  }
-
-  if (TEST_FLAG(ptr, F_APPLY_ORIENTATION)) {
-    pick_exif_orientation(ptr);
   }
 
   if (TEST_FLAG(ptr, F_PARSE_EXIF)) {
@@ -2375,9 +2389,406 @@ swap_cbcr(uint8_t* p, size_t size)
   }
 }
 
+static void
+do_transpose8(uint8_t* img, int wd, int ht, void* dst)
+{
+  int x;
+  int y;
+
+  uint8_t* sp;
+  uint8_t* dp;
+
+  sp = (uint8_t*)img;
+
+  for (y = 0; y < ht; y++) {
+    dp = (uint8_t*)dst + y;
+
+    for (x = 0; x < wd; x++) {
+      *dp = *sp;
+
+      sp++;
+      dp += ht;
+    }
+  }
+}
+
+static void
+do_transpose16(void* img, int wd, int ht, void* dst)
+{
+  int x;
+  int y;
+
+  uint16_t* sp;
+  uint16_t* dp;
+
+  sp = (uint16_t*)img;
+
+  for (y = 0; y < ht; y++) {
+    dp = (uint16_t*)dst + y;
+
+    for (x = 0; x < wd; x++) {
+      *dp = *sp;
+
+      sp++;
+      dp += ht;
+    }
+  }
+}
+
+static void
+do_transpose24(void* img, int wd, int ht, void* dst)
+{
+  int x;
+  int y;
+  int st;
+
+  uint8_t* sp;
+  uint8_t* dp;
+
+  sp = (uint8_t*)img;
+  st = ht * 3;
+
+  for (y = 0; y < ht; y++) {
+    dp = (uint8_t*)dst + (y * 3);
+
+    for (x = 0; x < wd; x++) {
+      dp[0] = sp[0];
+      dp[1] = sp[1];
+      dp[2] = sp[2];
+
+      sp += 3;
+      dp += st;
+    }
+  }
+}
+
+static void
+do_transpose32(void* img, int wd, int ht, void* dst)
+{
+  int x;
+  int y;
+
+  uint32_t* sp;
+  uint32_t* dp;
+
+  sp = (uint32_t*)img;
+
+  for (y = 0; y < ht; y++) {
+    dp = (uint32_t*)dst + y;
+
+    for (x = 0; x < wd; x++) {
+      *dp = *sp;
+
+      sp++;
+      dp += ht;
+    }
+  }
+}
+
+static void
+do_transpose(void* img, int wd, int ht, int nc, void* dst)
+{
+  switch (nc) {
+  case 1:
+    do_transpose8(img, wd, ht, dst);
+    break;
+
+  case 2:
+    do_transpose16(img, wd, ht, dst);
+    break;
+
+  case 3:
+    do_transpose24(img, wd, ht, dst);
+    break;
+
+  case 4:
+    do_transpose32(img, wd, ht, dst);
+    break;
+  }
+}
+
+static void
+do_upside_down8(void* img, int wd, int ht)
+{
+  uint8_t* sp;
+  uint8_t* dp;
+
+  sp = (uint8_t*)img;
+  dp = (uint8_t*)img + ((wd * ht) - 1);
+
+  while (sp < dp) {
+    SWAP(*sp, *dp, uint8_t);
+
+    sp++;
+    dp--;
+  }
+}
+
+static void
+do_upside_down16(void* img, int wd, int ht)
+{
+  uint16_t* sp;
+  uint16_t* dp;
+
+  sp = (uint16_t*)img;
+  dp = (uint16_t*)img + ((wd * ht) - 1);
+
+  while (sp < dp) {
+    SWAP(*sp, *dp, uint8_t);
+
+    sp++;
+    dp--;
+  }
+}
+
+static void
+do_upside_down24(void* img, int wd, int ht)
+{
+  uint8_t* sp;
+  uint8_t* dp;
+
+  sp = (uint8_t*)img;
+  dp = (uint8_t*)img + ((wd * ht * 3) - 3);
+
+  while (sp < dp) {
+    SWAP(sp[0], dp[0], uint8_t);
+    SWAP(sp[1], dp[1], uint8_t);
+    SWAP(sp[2], dp[2], uint8_t);
+
+    sp += 3;
+    dp -= 3;
+  }
+}
+
+static void
+do_upside_down32(void* img, int wd, int ht)
+{
+  uint32_t* sp;
+  uint32_t* dp;
+
+  sp = (uint32_t*)img;
+  dp = (uint32_t*)img + ((wd * ht) - 1);
+
+  ht /= 2;
+
+  while (sp < dp) {
+    SWAP(*sp, *dp, uint32_t);
+
+    sp++;
+    dp--;
+  }
+}
+
+static void
+do_upside_down(void* img, int wd, int ht, int nc)
+{
+  switch (nc) {
+  case 1:
+    do_upside_down8(img, wd, ht);
+    break;
+
+  case 2:
+    do_upside_down16(img, wd, ht);
+    break;
+
+  case 3:
+    do_upside_down24(img, wd, ht);
+    break;
+
+  case 4:
+    do_upside_down32(img, wd, ht);
+    break;
+  }
+}
+
+static void
+do_flip_horizon8(void* img, int wd, int ht)
+{
+  int y;
+  int st;
+
+  uint8_t* sp;
+  uint8_t* dp;
+
+  st  = wd;
+  wd /= 2;
+
+  sp = (uint8_t*)img;
+  dp = (uint8_t*)img + (st - 1);
+
+  for (y = 0; y < ht; y++) {
+    while (sp < dp) {
+      SWAP(*sp, *dp, uint8_t);
+
+      sp++;
+      dp--;
+    }
+
+    sp = sp - wd + st;
+    dp = sp + (st - 1);
+  }
+}
+
+static void
+do_flip_horizon16(void* img, int wd, int ht)
+{
+  int y;
+  int st;
+
+  uint16_t* sp;
+  uint16_t* dp;
+
+  st  = wd;
+  wd /= 2;
+
+  sp = (uint16_t*)img;
+  dp = (uint16_t*)img + (st - 1);
+
+  for (y = 0; y < ht; y++) {
+    while (sp < dp) {
+      SWAP(*sp, *dp, uint16_t);
+
+      sp++;
+      dp--;
+    }
+
+    sp = sp - wd + st;
+    dp = sp + (st - 1);
+  }
+}
+
+static void
+do_flip_horizon24(void* img, int wd, int ht)
+{
+  int y;
+  int st;
+
+  uint8_t* sp;
+  uint8_t* dp;
+
+  st  = wd * 3;
+  wd /= 2;
+
+  sp = (uint8_t*)img;
+  dp = (uint8_t*)img + (st - 3);
+
+  for (y = 0; y < ht; y++) {
+    while (sp < dp) {
+      SWAP(sp[0], dp[0], uint8_t);
+      SWAP(sp[1], dp[1], uint8_t);
+      SWAP(sp[2], dp[2], uint8_t);
+
+      sp += 3;
+      dp -= 3;
+    }
+
+    sp = (sp - (wd * 3)) + st;
+    dp = sp + (st - 3);
+  }
+}
+
+static void
+do_flip_horizon32(void* img, int wd, int ht)
+{
+  int y;
+  int st;
+
+  uint32_t* sp;
+  uint32_t* dp;
+
+  st  = wd;
+  wd /= 2;
+
+  sp = (uint32_t*)img;
+  dp = (uint32_t*)img + (st - 1);
+
+  for (y = 0; y < ht; y++) {
+    while (sp < dp) {
+      SWAP(*sp, *dp, uint32_t);
+
+      sp++;
+      dp--;
+    }
+
+    sp = sp - wd + st;
+    dp = sp + (st - 1);
+  }
+}
+
+static void
+do_flip_horizon(void* img, int wd, int ht, int nc)
+{
+  switch (nc) {
+  case 1:
+    do_flip_horizon8(img, wd, ht);
+    break;
+
+  case 2:
+    do_flip_horizon16(img, wd, ht);
+    break;
+
+  case 3:
+    do_flip_horizon24(img, wd, ht);
+    break;
+
+  case 4:
+    do_flip_horizon32(img, wd, ht);
+    break;
+  }
+}
+
+static VALUE
+shift_orientation_buffer(jpeg_decode_t* ptr, VALUE img)
+{
+  VALUE ret;
+  int len;
+
+  ret = ptr->orientation.buf;
+  len = RSTRING_LEN(img);
+
+  if (ret == Qnil || RSTRING_LEN(ret) != len) {
+    ret = rb_str_buf_new(len);
+    rb_str_set_len(ret, len);
+  }
+
+  ptr->orientation.buf = img;
+
+  return ret;
+}
+
 static VALUE
 apply_orientation(jpeg_decode_t* ptr, VALUE img)
 {
+  struct jpeg_decompress_struct* cinfo;
+  int wd;
+  int ht;
+  int nc;
+  VALUE tmp;
+
+  cinfo = &ptr->cinfo;
+  wd    = cinfo->output_width;
+  ht    = cinfo->output_height;
+  nc    = cinfo->output_components;
+
+  if (ptr->orientation.value & 4) {
+    /* 転置は交換アルゴリズムでは実装できないので新規バッファを
+       用意する */
+    tmp = img;
+    img = shift_orientation_buffer(ptr, tmp);
+    SWAP(wd, ht, int);
+
+    do_transpose(RSTRING_PTR(tmp), ht, wd, nc, RSTRING_PTR(img)); 
+  }
+
+  if (ptr->orientation.value & 2) {
+    do_upside_down(RSTRING_PTR(img), wd, ht, nc); 
+  }
+
+  if (ptr->orientation.value & 1) {
+    do_flip_horizon(RSTRING_PTR(img), wd, ht, nc); 
+  }
+
+  return img;
 }
 
 static VALUE
@@ -2475,11 +2886,12 @@ do_decode(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
 
       if (ptr->format == FMT_YVU) swap_cbcr(raw, raw_sz);
 
-      if (TEST_FLAG(ptr, F_NEED_META)) add_meta(ret, ptr);
-
       if (TEST_FLAG(ptr, F_APPLY_ORIENTATION)) {
+        pick_exif_orientation(ptr);
         ret = apply_orientation(ptr, ret);
       }
+
+      if (TEST_FLAG(ptr, F_NEED_META)) add_meta(ret, ptr);
 
       jpeg_finish_decompress(cinfo);
       jpeg_destroy_decompress(&ptr->cinfo);
