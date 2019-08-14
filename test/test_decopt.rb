@@ -863,7 +863,7 @@ class TestDecodeOptions < Test::Unit::TestCase
        "array"  => [],        # as true
        "hash"   => {})        # as true
 
-  test "orientation (decode)" do |val|
+  test "orientation (read header)" do |val|
     dec = assert_nothing_raised {
       JPEG::Decoder.new(:orientation => val)
     }

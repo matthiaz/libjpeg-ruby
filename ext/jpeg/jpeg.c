@@ -2315,6 +2315,10 @@ do_read_header(jpeg_decode_t* ptr, uint8_t* jpg, size_t jpg_sz)
     jpeg_read_header(&ptr->cinfo, TRUE);
     jpeg_calc_output_dimensions(&ptr->cinfo);
 
+    if (TEST_FLAG(ptr, F_APPLY_ORIENTATION)) {
+      pick_exif_orientation(ptr);
+    }
+
     ret = create_meta(ptr);
 
     jpeg_destroy_decompress(&ptr->cinfo);
